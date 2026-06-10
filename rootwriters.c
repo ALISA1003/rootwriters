@@ -14,7 +14,6 @@
 #include <linux/rwlock.h>
 #include <linux/uaccess.h>
 #include <linux/uidgid.h>
-#include <linux/kernel.h>
 #include <linux/version.h>
 #include <linux/limits.h>
 
@@ -55,6 +54,9 @@ struct ftrace_hook {
 };
 
 static struct ftrace_hook write_hook;
+
+typedef unsigned long (*ftrace_location_t)(unsigned long ip);
+static ftrace_location_t my_ftrace_location = NULL;
 
 static bool same_mtime(const struct timespec64 *a, const struct timespec64 *b)
 {
@@ -149,7 +151,7 @@ static void reload_config_if_needed(void)
 	char *buf = NULL;
 	char *cursor;
 	char *line;
-	uid_t parsed_uids[ROOTWRITERS_MAX_UIDS];
+	uid_t *parsed_uids = NULL;
 	size_t parsed_count = 0;
 	ssize_t bytes_read;
 	int ret;
@@ -182,8 +184,16 @@ static void reload_config_if_needed(void)
 	}
 	read_unlock(&cfg_lock);
 
+	/* Динамическое выделение памяти для предотвращения переполнения стека */
+	parsed_uids = kmalloc_array(ROOTWRITERS_MAX_UIDS, sizeof(uid_t), GFP_KERNEL);
+	if (!parsed_uids) {
+		filp_close(file, NULL);
+		return;
+	}
+
 	if (stat.size == 0) {
 		publish_config(parsed_uids, 0, CFG_EMPTY, &stat.mtime, stat.size);
+		kfree(parsed_uids);
 		filp_close(file, NULL);
 		pr_info("rootwriters: config exists and is empty, deny all\n");
 		return;
@@ -195,6 +205,7 @@ static void reload_config_if_needed(void)
 
 	buf = kzalloc(size_to_read + 1, GFP_KERNEL);
 	if (!buf) {
+		kfree(parsed_uids);
 		filp_close(file, NULL);
 		return;
 	}
@@ -204,6 +215,7 @@ static void reload_config_if_needed(void)
 
 	if (bytes_read < 0) {
 		kfree(buf);
+		kfree(parsed_uids);
 		return;
 	}
 
@@ -241,153 +253,4 @@ static void reload_config_if_needed(void)
 		publish_config(parsed_uids, parsed_count, CFG_LOADED,
 			       &stat.mtime, stat.size);
 		pr_info("rootwriters: config reloaded, %zu authorized UID(s)\n",
-			parsed_count);
-	}
-
-	kfree(buf);
-}
-
-static bool current_uid_is_authorized(void)
-{
-	kuid_t curr_kuid = current_uid();
-	uid_t current_val = __kuid_val(curr_kuid);
-	size_t i;
-	bool allowed = false;
-
-	read_lock(&cfg_lock);
-
-	switch (cfg_state) {
-	case CFG_MISSING:
-		allowed = true;
-		break;
-	case CFG_EMPTY:
-		allowed = false;
-		break;
-	case CFG_LOADED:
-		for (i = 0; i < authorized_count; i++) {
-			if (authorized_uids[i] == current_val) {
-				allowed = true;
-				break;
-			}
-		}
-		break;
-	}
-
-	read_unlock(&cfg_lock);
-	return allowed;
-}
-
-static ssize_t rootwriters_vfs_write(struct file *file,
-				     const char __user *buf,
-				     size_t count,
-				     loff_t *pos)
-{
-	struct inode *inode;
-
-	if (!file)
-		return real_vfs_write(file, buf, count, pos);
-
-	inode = file_inode(file);
-	if (!inode)
-		return real_vfs_write(file, buf, count, pos);
-
-	if (!S_ISREG(inode->i_mode))
-		return real_vfs_write(file, buf, count, pos);
-
-	if (__kuid_val(inode->i_uid) != 0)
-		return real_vfs_write(file, buf, count, pos);
-
-	reload_config_if_needed();
-
-	if (!current_uid_is_authorized()) {
-		pr_info_ratelimited("rootwriters: deny write for uid=%u to root-owned file\n",
-				    __kuid_val(current_uid()));
-		return -EACCES;
-	}
-
-	return real_vfs_write(file, buf, count, pos);
-}
-
-static void notrace rootwriters_ftrace_thunk(unsigned long ip,
-					     unsigned long parent_ip,
-					     struct ftrace_ops *ops,
-					     struct ftrace_regs *fregs)
-{
-	struct ftrace_hook *hook = container_of(ops, struct ftrace_hook, ops);
-
-	if (!within_module(parent_ip, THIS_MODULE))
-		ftrace_regs_set_instruction_pointer(fregs,
-						    (unsigned long)hook->function);
-}
-
-static int install_hook(struct ftrace_hook *hook)
-{
-	int ret;
-	unsigned long ftrace_addr;
-
-	hook->address = lookup_symbol_address(hook->name);
-	if (!hook->address)
-		return -ENOENT;
-
-	// Ищем точный адрес для хука ftrace (особенно важно для ARM64)
-	ftrace_addr = ftrace_location(hook->address);
-	if (!ftrace_addr) {
-		pr_err("rootwriters: ftrace_location() не нашел точку для %s\n", hook->name);
-		return -EINVAL;
-	}
-
-	real_vfs_write = (vfs_write_t)hook->address;
-
-	hook->ops.func = rootwriters_ftrace_thunk;
-	hook->ops.flags = FTRACE_OPS_FL_SAVE_REGS | FTRACE_OPS_FL_IPMODIFY;
-
-	// Передаем ftrace_addr вместо hook->address
-	ret = ftrace_set_filter_ip(&hook->ops, ftrace_addr, 0, 0);
-	if (ret)
-		return ret;
-
-	ret = register_ftrace_function(&hook->ops);
-	if (ret) {
-		ftrace_set_filter_ip(&hook->ops, ftrace_addr, 1, 0);
-		return ret;
-	}
-
-	return 0;
-}
-
-static void remove_hook(struct ftrace_hook *hook)
-{
-	unsigned long ftrace_addr = ftrace_location(hook->address);
-	unregister_ftrace_function(&hook->ops);
-	if (ftrace_addr)
-		ftrace_set_filter_ip(&hook->ops, ftrace_addr, 1, 0);
-}
-
-static int __init rootwriters_init(void)
-{
-	int ret;
-
-	write_hook.name = "vfs_write";
-	write_hook.function = rootwriters_vfs_write;
-
-	set_cfg_missing();
-	reload_config_if_needed();
-
-	ret = install_hook(&write_hook);
-	if (ret) {
-		pr_err("rootwriters: failed to install ftrace hook, err=%d\n", ret);
-		return ret;
-	}
-
-	pr_info("rootwriters: loaded\n");
-	return 0;
-}
-
-static void __exit rootwriters_exit(void)
-{
-	remove_hook(&write_hook);
-	pr_info("rootwriters: unloaded\n");
-}
-
-module_init(rootwriters_init);
-module_exit(rootwriters_exit);
+			
