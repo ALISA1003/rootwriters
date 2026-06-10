@@ -249,8 +249,8 @@ static void reload_config_if_needed(void)
 
 static bool current_uid_is_authorized(void)
 {
-	kuid_t current = current_uid();
-	uid_t current_val = __kuid_val(current);
+	kuid_t curr_kuid = current_uid();
+	uid_t current_val = __kuid_val(curr_kuid);
 	size_t i;
 	bool allowed = false;
 
