@@ -13,7 +13,8 @@
 #include <linux/jiffies.h>
 #include <linux/rwlock.h>
 #include <linux/uaccess.h>
-#include <linux/kuid.h>
+#include <linux/uidgid.h>
+#include <linux/kernel.h>
 #include <linux/version.h>
 #include <linux/limits.h>
 
