@@ -12,6 +12,24 @@ CURRENT_USER="$(id -un)"
 
 echo "[*] Repo: ${REPO_DIR}"
 echo "[*] Kernel: $(uname -r)"
+echo "[*] Arch:   $(uname -m)"
+
+# Для ftrace-хука с перенаправлением IP (IPMODIFY) ядро должно быть
+# собрано с CONFIG_DYNAMIC_FTRACE_WITH_REGS. Предупреждаем заранее.
+CONFIG_GZ="/proc/config.gz"
+if [ -r "${CONFIG_GZ}" ]; then
+    if zcat "${CONFIG_GZ}" | grep -q '^CONFIG_DYNAMIC_FTRACE_WITH_REGS=y'; then
+        echo "[*] CONFIG_DYNAMIC_FTRACE_WITH_REGS=y (OK)"
+    else
+        echo "[!] ВНИМАНИЕ: CONFIG_DYNAMIC_FTRACE_WITH_REGS не включен — хук может не заработать"
+    fi
+elif [ -r "/boot/config-$(uname -r)" ]; then
+    if grep -q '^CONFIG_DYNAMIC_FTRACE_WITH_REGS=y' "/boot/config-$(uname -r)"; then
+        echo "[*] CONFIG_DYNAMIC_FTRACE_WITH_REGS=y (OK)"
+    else
+        echo "[!] ВНИМАНИЕ: CONFIG_DYNAMIC_FTRACE_WITH_REGS не включен — хук может не заработать"
+    fi
+fi
 
 if ! command -v sudo >/dev/null 2>&1; then
     echo "[!] sudo not found"

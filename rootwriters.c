@@ -17,6 +17,19 @@
 #include <linux/version.h>
 #include <linux/limits.h>
 
+#ifdef CONFIG_ARM64
+#include <asm/insn.h>
+#endif
+
+/*
+ * Размер одной инструкции на arm64 = 4 байта. На arm64 точка трассировки
+ * ftrace располагается не точно по адресу символа (там BTI/patchable-entry),
+ * поэтому ftrace-location нужно искать по диапазону первых инструкций.
+ */
+#ifndef AARCH64_INSN_SIZE
+#define AARCH64_INSN_SIZE 4
+#endif
+
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Aleksandr Isaev");
 MODULE_DESCRIPTION("Restrict writes to root-owned files using /etc/fsc/rootwriters");
@@ -55,8 +68,9 @@ struct ftrace_hook {
 
 static struct ftrace_hook write_hook;
 
-typedef unsigned long (*ftrace_location_t)(unsigned long ip);
-static ftrace_location_t my_ftrace_location = NULL;
+typedef unsigned long (*ftrace_location_range_t)(unsigned long start,
+						 unsigned long end);
+static ftrace_location_range_t my_ftrace_location_range = NULL;
 
 static bool same_mtime(const struct timespec64 *a, const struct timespec64 *b)
 {
@@ -333,41 +347,65 @@ static void notrace rootwriters_ftrace_thunk(unsigned long ip,
 						    (unsigned long)hook->function);
 }
 
+/*
+ * Возвращает корректный ftrace-location для функции. На arm64 ищем по
+ * диапазону [addr, addr + AARCH64_INSN_SIZE), т.к. patchable-точка смещена
+ * относительно символа. На остальных архитектурах диапазон в одну инструкцию
+ * тоже работает корректно.
+ */
+static unsigned long resolve_ftrace_location(unsigned long addr)
+{
+	if (!my_ftrace_location_range)
+		return 0;
+
+	return my_ftrace_location_range(addr, addr + AARCH64_INSN_SIZE);
+}
+
 static int install_hook(struct ftrace_hook *hook)
 {
 	int ret;
 	unsigned long ftrace_addr;
+	unsigned long symbol_addr;
 
-	if (!my_ftrace_location) {
-		my_ftrace_location = (ftrace_location_t)lookup_symbol_address("ftrace_location");
-		if (!my_ftrace_location) {
-			pr_err("rootwriters: не удалось найти функцию ftrace_location\n");
+	if (!my_ftrace_location_range) {
+		my_ftrace_location_range =
+			(ftrace_location_range_t)lookup_symbol_address("ftrace_location_range");
+		if (!my_ftrace_location_range) {
+			pr_err("rootwriters: не удалось найти функцию ftrace_location_range\n");
 			return -ENOENT;
 		}
 	}
 
-	hook->address = lookup_symbol_address(hook->name);
-	if (!hook->address)
+	symbol_addr = lookup_symbol_address(hook->name);
+	if (!symbol_addr) {
+		pr_err("rootwriters: не удалось найти адрес символа %s\n", hook->name);
 		return -ENOENT;
+	}
 
-	ftrace_addr = my_ftrace_location(hook->address);
+	ftrace_addr = resolve_ftrace_location(symbol_addr);
 	if (!ftrace_addr) {
-		pr_err("rootwriters: ftrace_location не нашел точку для %s\n", hook->name);
+		pr_err("rootwriters: ftrace_location_range не нашел точку для %s\n", hook->name);
 		return -EINVAL;
 	}
 
-	real_vfs_write = (vfs_write_t)hook->address;
+	/* Реальная функция для вызова — по адресу символа */
+	real_vfs_write = (vfs_write_t)symbol_addr;
+
+	/* Сохраняем реальную ftrace-точку, чтобы корректно снять фильтр при выгрузке */
+	hook->address = ftrace_addr;
 
 	hook->ops.func = rootwriters_ftrace_thunk;
-	
-    hook->ops.flags = FTRACE_OPS_FL_SAVE_REGS | FTRACE_OPS_FL_IPMODIFY;
+	hook->ops.flags = FTRACE_OPS_FL_SAVE_REGS | FTRACE_OPS_FL_IPMODIFY;
 
 	ret = ftrace_set_filter_ip(&hook->ops, ftrace_addr, 0, 0);
-	if (ret)
+	if (ret) {
+		pr_err("rootwriters: ftrace_set_filter_ip failed, err=%d\n", ret);
 		return ret;
+	}
 
 	ret = register_ftrace_function(&hook->ops);
 	if (ret) {
+		pr_err("rootwriters: register_ftrace_function failed, err=%d\n", ret);
 		ftrace_set_filter_ip(&hook->ops, ftrace_addr, 1, 0);
 		return ret;
 	}
@@ -377,14 +415,11 @@ static int install_hook(struct ftrace_hook *hook)
 
 static void remove_hook(struct ftrace_hook *hook)
 {
-	unsigned long ftrace_addr;
 	unregister_ftrace_function(&hook->ops);
 
-	if (my_ftrace_location) {
-		ftrace_addr = my_ftrace_location(hook->address);
-		if (ftrace_addr)
-			ftrace_set_filter_ip(&hook->ops, ftrace_addr, 1, 0);
-	}
+	/* hook->address уже содержит резолвнутую ftrace-точку (см. install_hook) */
+	if (hook->address)
+		ftrace_set_filter_ip(&hook->ops, hook->address, 1, 0);
 }
 
 static int __init rootwriters_init(void)
