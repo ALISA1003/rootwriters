@@ -1,0 +1,7 @@
+# /etc/fsc/rootwriters
+# Only the first whitespace-separated field is used.
+# Blank lines and comments are ignored.
+# Extra fields are allowed and ignored.
+
+0 root
+1000 alex
