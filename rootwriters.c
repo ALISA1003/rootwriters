@@ -323,23 +323,32 @@ static void notrace rootwriters_ftrace_thunk(unsigned long ip,
 static int install_hook(struct ftrace_hook *hook)
 {
 	int ret;
+	unsigned long ftrace_addr;
 
 	hook->address = lookup_symbol_address(hook->name);
 	if (!hook->address)
 		return -ENOENT;
+
+	// Ищем точный адрес для хука ftrace (особенно важно для ARM64)
+	ftrace_addr = ftrace_location(hook->address);
+	if (!ftrace_addr) {
+		pr_err("rootwriters: ftrace_location() не нашел точку для %s\n", hook->name);
+		return -EINVAL;
+	}
 
 	real_vfs_write = (vfs_write_t)hook->address;
 
 	hook->ops.func = rootwriters_ftrace_thunk;
 	hook->ops.flags = FTRACE_OPS_FL_SAVE_REGS | FTRACE_OPS_FL_IPMODIFY;
 
-	ret = ftrace_set_filter_ip(&hook->ops, hook->address, 0, 0);
+	// Передаем ftrace_addr вместо hook->address
+	ret = ftrace_set_filter_ip(&hook->ops, ftrace_addr, 0, 0);
 	if (ret)
 		return ret;
 
 	ret = register_ftrace_function(&hook->ops);
 	if (ret) {
-		ftrace_set_filter_ip(&hook->ops, hook->address, 1, 0);
+		ftrace_set_filter_ip(&hook->ops, ftrace_addr, 1, 0);
 		return ret;
 	}
 
@@ -348,8 +357,10 @@ static int install_hook(struct ftrace_hook *hook)
 
 static void remove_hook(struct ftrace_hook *hook)
 {
+	unsigned long ftrace_addr = ftrace_location(hook->address);
 	unregister_ftrace_function(&hook->ops);
-	ftrace_set_filter_ip(&hook->ops, hook->address, 1, 0);
+	if (ftrace_addr)
+		ftrace_set_filter_ip(&hook->ops, ftrace_addr, 1, 0);
 }
 
 static int __init rootwriters_init(void)
