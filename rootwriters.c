@@ -359,7 +359,15 @@ static int install_hook(struct ftrace_hook *hook)
 	real_vfs_write = (vfs_write_t)hook->address;
 
 	hook->ops.func = rootwriters_ftrace_thunk;
-	hook->ops.flags = FTRACE_OPS_FL_SAVE_REGS | FTRACE_OPS_FL_IPMODIFY;
+	
+	/* Используем макрос, который требует сохранение регистров только если архитектура это умеет.
+	 * На многих arm64 FTRACE_OPS_FL_SAVE_REGS с IPMODIFY может возвращать -EINVAL.
+	 */
+#ifndef FTRACE_OPS_FL_SAVE_REGS_IF_SUPPORTED
+#define FTRACE_OPS_FL_SAVE_REGS_IF_SUPPORTED FTRACE_OPS_FL_SAVE_REGS
+#endif
+
+	hook->ops.flags = FTRACE_OPS_FL_SAVE_REGS_IF_SUPPORTED | FTRACE_OPS_FL_IPMODIFY | FTRACE_OPS_FL_RECURSION_SAFE;
 
 	ret = ftrace_set_filter_ip(&hook->ops, ftrace_addr, 0, 0);
 	if (ret)
